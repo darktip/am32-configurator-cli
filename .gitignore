@@ -1,0 +1,50 @@
+# IDE/editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+*.user
+*.user.*
+*.autosave
+
+# Qt Creator / clangd generated state
+.qtc_clangd/.cache/
+.cache/
+compile_commands.json
+
+# Qt build output
+build/
+build-*/
+debug/
+release/
+.moc/
+.obj/
+.rcc/
+.qmake.stash
+Makefile
+Makefile.*
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+object_script.*
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.pdb
+*.ilk
+*.idb
+*.dSYM/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
