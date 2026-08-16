@@ -57,6 +57,9 @@ struct Options {
     int connectAttempts = DefaultConnectAttempts;
     int connectDelayMs = DefaultConnectDelayMs;
     int passthroughDelayMs = DefaultPassthroughDelayMs;
+    bool verifyReadback = true;
+    bool resetEscAfterWrite = false;
+    bool resetFcAfterWrite = false;
     bool reverse = false;
     bool help = false;
 };
@@ -134,6 +137,11 @@ void printUsage() {
         << "                      Delay between failed ESC connect attempts. Default: 300.\n"
         << "  --passthrough-delay-ms <ms>\n"
         << "                      Delay after MSP passthrough before ESC connect. Default: 2000.\n"
+        << "  --no-verify         Skip EEPROM readback after write.\n"
+        << "  --reset-esc-after-write\n"
+        << "                      Reset the target ESC after write. Disabled by default.\n"
+        << "  --reset-fc-after-write\n"
+        << "                      Send MSP FC reset after exiting four-way. Disabled by default.\n"
         << "  --help              Show this help.\n\n"
         << "Exit codes:\n"
         << "  0 success\n"
@@ -190,6 +198,21 @@ std::optional<Options> parseArguments(int argc, char* argv[], std::string& error
 
         if (arg == "--reverse") {
             options.reverse = true;
+            continue;
+        }
+
+        if (arg == "--no-verify") {
+            options.verifyReadback = false;
+            continue;
+        }
+
+        if (arg == "--reset-esc-after-write") {
+            options.resetEscAfterWrite = true;
+            continue;
+        }
+
+        if (arg == "--reset-fc-after-write") {
+            options.resetFcAfterWrite = true;
             continue;
         }
 
@@ -363,6 +386,36 @@ Bytes makeFourWayWriteCommand(const Bytes& payload, std::uint16_t address) {
     out.insert(out.end(), payload.begin(), payload.end());
     appendFourWayCrc(out);
     return out;
+}
+
+Bytes makeFourWayReadCommand(std::size_t byteCount, std::uint16_t address) {
+    if (byteCount == 0 || byteCount > 256) {
+        throw std::runtime_error("four-way read size must be 1-256 bytes");
+    }
+
+    Bytes out;
+    out.reserve(8);
+    out.push_back(FourWayPcMarker);
+    out.push_back(0x3a);
+    out.push_back(static_cast<std::uint8_t>((address >> 8) & 0xff));
+    out.push_back(static_cast<std::uint8_t>(address & 0xff));
+    out.push_back(0x01);
+    out.push_back(static_cast<std::uint8_t>(byteCount == 256 ? 0 : byteCount));
+    appendFourWayCrc(out);
+    return out;
+}
+
+Bytes fourWayParams(const Bytes& frame) {
+    if (frame.size() < 8) {
+        return {};
+    }
+
+    const std::size_t paramCount = frame[4] == 0 ? 256 : frame[4];
+    if (frame.size() < 8 + paramCount) {
+        return {};
+    }
+
+    return Bytes(frame.begin() + 5, frame.begin() + static_cast<std::ptrdiff_t>(5 + paramCount));
 }
 
 Bytes makeMspCommand(std::uint8_t command, const Bytes& payload = {}) {
@@ -801,7 +854,40 @@ void writeEeprom(SerialPort& serial, const Bytes& config, std::uint16_t eepromAd
     logInfo("EEPROM write acknowledged by ESC");
 }
 
-void cleanupPassthrough(SerialPort& serial) {
+void verifyEepromReadback(SerialPort& serial, const Bytes& expectedConfig, std::uint16_t eepromAddress) {
+    auto response = transactFourWay(
+        serial,
+        makeFourWayReadCommand(expectedConfig.size(), eepromAddress),
+        "EEPROM readback",
+        1500);
+
+    if (!response.error.empty()) {
+        throw ProtocolException(response.error);
+    }
+    if (!isAckOk(response.frame)) {
+        throw std::runtime_error("ESC returned bad ACK for EEPROM readback: " + describeFourWayFrame(response.frame));
+    }
+
+    const Bytes actual = fourWayParams(response.frame);
+    if (actual.size() != expectedConfig.size()) {
+        throw std::runtime_error("EEPROM readback size mismatch: expected " +
+                                 std::to_string(expectedConfig.size()) + ", got " + std::to_string(actual.size()));
+    }
+
+    if (actual != expectedConfig) {
+        for (std::size_t i = 0; i < expectedConfig.size(); ++i) {
+            if (actual[i] != expectedConfig[i]) {
+                throw std::runtime_error("EEPROM readback mismatch at byte " + std::to_string(i) +
+                                         ": expected " + hexByte(expectedConfig[i]) +
+                                         ", got " + hexByte(actual[i]));
+            }
+        }
+    }
+
+    logInfo("EEPROM readback matches written config");
+}
+
+void cleanupPassthrough(SerialPort& serial, bool resetFlightController) {
     try {
         logInfo("ending four-way interface");
         auto endResponse = transactFourWay(serial, makeFourWayCommand(0x34, 0x00), "four-way end", 500);
@@ -810,6 +896,11 @@ void cleanupPassthrough(SerialPort& serial) {
         }
     } catch (const std::exception& ex) {
         logWarn(std::string("four-way cleanup failed: ") + ex.what());
+    }
+
+    if (!resetFlightController) {
+        logInfo("FC reset skipped");
+        return;
     }
 
     try {
@@ -822,22 +913,26 @@ void cleanupPassthrough(SerialPort& serial) {
     }
 }
 
-void cleanupEscAfterWrite(SerialPort& serial, int motorIndex) {
-    try {
-        logInfo("resetting ESC after write");
-        auto resetResponse = transactFourWay(
-            serial,
-            makeFourWayCommand(0x35, static_cast<std::uint8_t>(motorIndex)),
-            "ESC reset",
-            500);
-        if (!resetResponse.error.empty()) {
-            logWarn("ESC reset response was not valid: " + resetResponse.error);
+void cleanupAfterWrite(SerialPort& serial, int motorIndex, bool resetEsc, bool resetFlightController) {
+    if (resetEsc) {
+        try {
+            logInfo("resetting ESC after write");
+            auto resetResponse = transactFourWay(
+                serial,
+                makeFourWayCommand(0x35, static_cast<std::uint8_t>(motorIndex)),
+                "ESC reset",
+                500);
+            if (!resetResponse.error.empty()) {
+                logWarn("ESC reset response was not valid: " + resetResponse.error);
+            }
+        } catch (const std::exception& ex) {
+            logWarn(std::string("ESC reset cleanup failed: ") + ex.what());
         }
-    } catch (const std::exception& ex) {
-        logWarn(std::string("ESC reset cleanup failed: ") + ex.what());
+    } else {
+        logInfo("ESC reset skipped");
     }
 
-    cleanupPassthrough(serial);
+    cleanupPassthrough(serial, resetFlightController);
 }
 
 int run(const Options& options) {
@@ -882,7 +977,7 @@ int run(const Options& options) {
     if (expectedEscCount && options.motorIndex >= *expectedEscCount) {
         logError("requested ESC index " + std::to_string(options.motorIndex) +
                  " but flight controller reported only " + std::to_string(*expectedEscCount) + " ESC output(s)");
-        cleanupPassthrough(serial);
+        cleanupPassthrough(serial, false);
         return static_cast<int>(ExitCode::InvalidArguments);
     }
 
@@ -896,25 +991,33 @@ int run(const Options& options) {
         return static_cast<int>(ExitCode::SerialIoError);
     } catch (const std::exception& ex) {
         logError(ex.what());
-        cleanupPassthrough(serial);
+        cleanupPassthrough(serial, false);
         return static_cast<int>(ExitCode::EscConnectError);
     }
 
     try {
         logInfo("writing 48-byte EEPROM config to address " + hexWord(eepromAddress));
         writeEeprom(serial, config, eepromAddress);
+        if (options.verifyReadback) {
+            verifyEepromReadback(serial, config, eepromAddress);
+        } else {
+            logInfo("EEPROM readback verification skipped");
+        }
     } catch (const SerialIoException& ex) {
         logError(std::string("serial I/O failed during EEPROM write: ") + ex.what());
+        cleanupPassthrough(serial, false);
         return static_cast<int>(ExitCode::SerialIoError);
     } catch (const ProtocolException& ex) {
         logError(std::string("protocol error during EEPROM write: ") + ex.what());
+        cleanupPassthrough(serial, false);
         return static_cast<int>(ExitCode::ProtocolError);
     } catch (const std::exception& ex) {
         logError(std::string("EEPROM write failed: ") + ex.what());
+        cleanupPassthrough(serial, false);
         return static_cast<int>(ExitCode::EscWriteError);
     }
 
-    cleanupEscAfterWrite(serial, options.motorIndex);
+    cleanupAfterWrite(serial, options.motorIndex, options.resetEscAfterWrite, options.resetFcAfterWrite);
     logInfo("completed successfully");
     return static_cast<int>(ExitCode::Success);
 }
