@@ -34,6 +34,8 @@ constexpr std::size_t ConfigSize = 48;
 constexpr std::size_t DirectionByteIndex = 17;
 constexpr std::uint8_t FourWayPcMarker = 0x2f;
 constexpr std::uint8_t FourWayEscMarker = 0x2e;
+constexpr int DefaultConnectAttempts = 30;
+constexpr int DefaultConnectDelayMs = 300;
 
 enum class ExitCode : int {
     Success = 0,
@@ -51,6 +53,8 @@ struct Options {
     std::string port;
     int motorIndex = -1;
     std::string configPath;
+    int connectAttempts = DefaultConnectAttempts;
+    int connectDelayMs = DefaultConnectDelayMs;
     bool reverse = false;
     bool help = false;
 };
@@ -122,6 +126,10 @@ void printUsage() {
         << "  --config <path>     AM32 EEPROM config binary. First 48 bytes are written.\n\n"
         << "Optional arguments:\n"
         << "  --reverse           Set EEPROM direction byte 17 to reverse before writing.\n"
+        << "  --connect-attempts <count>\n"
+        << "                      ESC connect attempts before failing. Default: 30.\n"
+        << "  --connect-delay-ms <ms>\n"
+        << "                      Delay between failed ESC connect attempts. Default: 300.\n"
         << "  --help              Show this help.\n\n"
         << "Exit codes:\n"
         << "  0 success\n"
@@ -144,6 +152,25 @@ std::optional<std::string> takeValue(int& i, int argc, char* argv[], const std::
         return std::nullopt;
     }
     return argv[++i];
+}
+
+std::optional<int> parseIntInRange(const std::string& value,
+                                   int minimum,
+                                   int maximum,
+                                   const std::string& optionName,
+                                   std::string& error) {
+    try {
+        std::size_t consumed = 0;
+        const int parsed = std::stoi(value, &consumed, 10);
+        if (consumed != value.size() || parsed < minimum || parsed > maximum) {
+            error = optionName + " must be an integer in range " + std::to_string(minimum) + "-" + std::to_string(maximum);
+            return std::nullopt;
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        error = optionName + " must be an integer in range " + std::to_string(minimum) + "-" + std::to_string(maximum);
+        return std::nullopt;
+    }
 }
 
 std::optional<Options> parseArguments(int argc, char* argv[], std::string& error) {
@@ -178,18 +205,11 @@ std::optional<Options> parseArguments(int argc, char* argv[], std::string& error
                 error = "--index requires a value";
                 return std::nullopt;
             }
-            try {
-                std::size_t consumed = 0;
-                const int parsed = std::stoi(*value, &consumed, 10);
-                if (consumed != value->size() || parsed < 0 || parsed > 3) {
-                    error = "--index must be an integer in range 0-3";
-                    return std::nullopt;
-                }
-                options.motorIndex = parsed;
-            } catch (const std::exception&) {
-                error = "--index must be an integer in range 0-3";
+            auto parsed = parseIntInRange(*value, 0, 3, "--index", error);
+            if (!parsed) {
                 return std::nullopt;
             }
+            options.motorIndex = *parsed;
             continue;
         }
 
@@ -200,6 +220,34 @@ std::optional<Options> parseArguments(int argc, char* argv[], std::string& error
                 return std::nullopt;
             }
             options.configPath = *value;
+            continue;
+        }
+
+        if (arg == "--connect-attempts" || arg.rfind("--connect-attempts=", 0) == 0) {
+            auto value = takeValue(i, argc, argv, arg);
+            if (!value || value->empty()) {
+                error = "--connect-attempts requires a value";
+                return std::nullopt;
+            }
+            auto parsed = parseIntInRange(*value, 1, 120, "--connect-attempts", error);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            options.connectAttempts = *parsed;
+            continue;
+        }
+
+        if (arg == "--connect-delay-ms" || arg.rfind("--connect-delay-ms=", 0) == 0) {
+            auto value = takeValue(i, argc, argv, arg);
+            if (!value || value->empty()) {
+                error = "--connect-delay-ms requires a value";
+                return std::nullopt;
+            }
+            auto parsed = parseIntInRange(*value, 0, 5000, "--connect-delay-ms", error);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            options.connectDelayMs = *parsed;
             continue;
         }
 
@@ -600,9 +648,13 @@ ParsedFourWayResponse transactFourWay(SerialPort& serial,
     return parseFourWayResponse(raw);
 }
 
-std::uint16_t connectEsc(SerialPort& serial, int motorIndex) {
-    for (int attempt = 1; attempt <= 4; ++attempt) {
-        logInfo("connecting to ESC index " + std::to_string(motorIndex) + ", attempt " + std::to_string(attempt));
+std::uint16_t connectEsc(SerialPort& serial, int motorIndex, int maxAttempts, int retryDelayMs) {
+    std::string lastFailure;
+
+    for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+        logInfo("connecting to ESC index " + std::to_string(motorIndex) + ", attempt " +
+                std::to_string(attempt) + "/" + std::to_string(maxAttempts));
+
         auto response = transactFourWay(
             serial,
             makeFourWayCommand(0x37, static_cast<std::uint8_t>(motorIndex)),
@@ -610,39 +662,46 @@ std::uint16_t connectEsc(SerialPort& serial, int motorIndex) {
             1000);
 
         if (!response.error.empty()) {
-            logWarn(response.error);
-            continue;
-        }
-        if (!isAckOk(response.frame)) {
-            logWarn("ESC connect returned bad ACK: " + describeFourWayFrame(response.frame));
-            continue;
-        }
-        if (response.frame.size() <= 6) {
-            throw std::runtime_error("ESC connect frame is too short to identify MCU");
+            lastFailure = response.error;
+            logInfo("ESC connect attempt failed: " + lastFailure);
+        } else if (!isAckOk(response.frame)) {
+            lastFailure = describeFourWayFrame(response.frame);
+            logInfo("ESC connect attempt rejected: " + lastFailure);
+        } else {
+            if (response.frame.size() <= 6) {
+                throw std::runtime_error("ESC connect frame is too short to identify MCU");
+            }
+
+            const std::uint8_t mcu = response.frame[6];
+            if (mcu == 0x2b) {
+                logInfo("detected G071 ESC, EEPROM address " + hexWord(EepromAddressG071));
+                return EepromAddressG071;
+            }
+            if (mcu == 0x1f) {
+                logInfo("detected F051 ESC, EEPROM address " + hexWord(EepromAddressF051));
+                return EepromAddressF051;
+            }
+            if (mcu == 0x35) {
+                logInfo("detected F3 ESC, EEPROM address " + hexWord(EepromAddressF3));
+                return EepromAddressF3;
+            }
+            if (mcu == 0x15) {
+                logInfo("detected NXP ESC, EEPROM address " + hexWord(EepromAddressNxp));
+                return EepromAddressNxp;
+            }
+
+            lastFailure = "unsupported/unknown ESC MCU id " + hexByte(mcu);
+            logInfo("ESC connect attempt failed: " + lastFailure);
         }
 
-        const std::uint8_t mcu = response.frame[6];
-        if (mcu == 0x2b) {
-            logInfo("detected G071 ESC, EEPROM address " + hexWord(EepromAddressG071));
-            return EepromAddressG071;
+        if (attempt < maxAttempts && retryDelayMs > 0) {
+            logInfo("waiting " + std::to_string(retryDelayMs) + " ms before next ESC connect attempt");
+            std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
         }
-        if (mcu == 0x1f) {
-            logInfo("detected F051 ESC, EEPROM address " + hexWord(EepromAddressF051));
-            return EepromAddressF051;
-        }
-        if (mcu == 0x35) {
-            logInfo("detected F3 ESC, EEPROM address " + hexWord(EepromAddressF3));
-            return EepromAddressF3;
-        }
-        if (mcu == 0x15) {
-            logInfo("detected NXP ESC, EEPROM address " + hexWord(EepromAddressNxp));
-            return EepromAddressNxp;
-        }
-
-        logWarn("unsupported/unknown ESC MCU id " + hexByte(mcu));
     }
 
-    throw std::runtime_error("could not connect to ESC index " + std::to_string(motorIndex));
+    throw std::runtime_error("could not connect to ESC index " + std::to_string(motorIndex) +
+                             ". Last response: " + (lastFailure.empty() ? "none" : lastFailure));
 }
 
 void startPassthrough(SerialPort& serial) {
@@ -678,21 +737,7 @@ void writeEeprom(SerialPort& serial, const Bytes& config, std::uint16_t eepromAd
     logInfo("EEPROM write acknowledged by ESC");
 }
 
-void cleanupEsc(SerialPort& serial, int motorIndex) {
-    try {
-        logInfo("resetting ESC after write");
-        auto resetResponse = transactFourWay(
-            serial,
-            makeFourWayCommand(0x35, static_cast<std::uint8_t>(motorIndex)),
-            "ESC reset",
-            500);
-        if (!resetResponse.error.empty()) {
-            logWarn("ESC reset response was not valid: " + resetResponse.error);
-        }
-    } catch (const std::exception& ex) {
-        logWarn(std::string("ESC reset cleanup failed: ") + ex.what());
-    }
-
+void cleanupPassthrough(SerialPort& serial) {
     try {
         logInfo("ending four-way interface");
         auto endResponse = transactFourWay(serial, makeFourWayCommand(0x34, 0x00), "four-way end", 500);
@@ -711,6 +756,24 @@ void cleanupEsc(SerialPort& serial, int motorIndex) {
     } catch (const std::exception& ex) {
         logWarn(std::string("MSP cleanup failed: ") + ex.what());
     }
+}
+
+void cleanupEscAfterWrite(SerialPort& serial, int motorIndex) {
+    try {
+        logInfo("resetting ESC after write");
+        auto resetResponse = transactFourWay(
+            serial,
+            makeFourWayCommand(0x35, static_cast<std::uint8_t>(motorIndex)),
+            "ESC reset",
+            500);
+        if (!resetResponse.error.empty()) {
+            logWarn("ESC reset response was not valid: " + resetResponse.error);
+        }
+    } catch (const std::exception& ex) {
+        logWarn(std::string("ESC reset cleanup failed: ") + ex.what());
+    }
+
+    cleanupPassthrough(serial);
 }
 
 int run(const Options& options) {
@@ -753,12 +816,15 @@ int run(const Options& options) {
 
     std::uint16_t eepromAddress = 0;
     try {
-        eepromAddress = connectEsc(serial, options.motorIndex);
+        logInfo("ESC connect retry policy: " + std::to_string(options.connectAttempts) +
+                " attempts, " + std::to_string(options.connectDelayMs) + " ms delay");
+        eepromAddress = connectEsc(serial, options.motorIndex, options.connectAttempts, options.connectDelayMs);
     } catch (const SerialIoException& ex) {
         logError(std::string("serial I/O failed while connecting to ESC: ") + ex.what());
         return static_cast<int>(ExitCode::SerialIoError);
     } catch (const std::exception& ex) {
         logError(ex.what());
+        cleanupPassthrough(serial);
         return static_cast<int>(ExitCode::EscConnectError);
     }
 
@@ -776,7 +842,7 @@ int run(const Options& options) {
         return static_cast<int>(ExitCode::EscWriteError);
     }
 
-    cleanupEsc(serial, options.motorIndex);
+    cleanupEscAfterWrite(serial, options.motorIndex);
     logInfo("completed successfully");
     return static_cast<int>(ExitCode::Success);
 }

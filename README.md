@@ -22,6 +22,8 @@ Arguments:
 - `--index <0-3>`: ESC/motor index behind the flight-controller passthrough.
 - `--config <path>`: AM32 EEPROM config binary. The first 48 bytes are written.
 - `--reverse`: sets EEPROM byte `17` to `1` before writing. Without this flag, byte `17` is left as it exists in the config file.
+- `--connect-attempts <count>`: ESC connect attempts before failing. Default: `30`.
+- `--connect-delay-ms <ms>`: delay between failed ESC connect attempts. Default: `300`.
 - `--help`: prints usage and exit codes.
 
 All logs, warnings, and errors are written to standard output.
@@ -92,3 +94,9 @@ then the flight controller is responding and four-way passthrough is active, but
 - The ESC signal wire is connected to that output.
 
 It is acceptable for the MSP setup commands to show `RX <none>` if the later four-way connect succeeds. Some flight-controller firmware enters passthrough without returning a visible MSP response.
+
+The CLI treats early connect rejections as transient and keeps trying for the configured retry window. If the ESC often needs longer to become ready, increase the window:
+
+```powershell
+am32-cli --port COM4 --index 2 --config .\am32_v3_config.bin --reverse --connect-attempts 60 --connect-delay-ms 500
+```
