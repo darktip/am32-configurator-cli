@@ -12,6 +12,12 @@
 .cache/
 compile_commands.json
 
+# CMake generated state
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+
 # Qt build output
 build/
 build-*/
