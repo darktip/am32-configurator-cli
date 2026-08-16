@@ -1,3 +1,17 @@
+/*
+ * AM32 CLI Configurator
+ *
+ * Derived from AM32 Offline-Configurator:
+ * https://github.com/am32-firmware/Offline-Configurator
+ *
+ * Protocol behavior references AM32 Configurator:
+ * https://github.com/am32-firmware/am32-configurator
+ *
+ * Modified in 2026 to provide a command-line EEPROM writer.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

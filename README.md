@@ -32,6 +32,20 @@ Arguments:
 
 All logs, warnings, and errors are written to standard output.
 
+## Attribution and license
+
+This project is based on/forked from AM32 Offline-Configurator:
+
+https://github.com/am32-firmware/Offline-Configurator
+
+It also references protocol behavior from AM32 Configurator:
+
+https://github.com/am32-firmware/am32-configurator
+
+This derivative work is distributed under the GNU GPL v3.0. See `LICENSE` and `NOTICE.md`.
+
+Original copyrights remain with the upstream AM32 firmware / AlkaMotors electronics inc. authors and contributors.
+
 ## Exit codes
 
 | Code | Meaning |
