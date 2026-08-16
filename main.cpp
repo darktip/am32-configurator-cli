@@ -36,6 +36,7 @@ constexpr std::uint8_t FourWayPcMarker = 0x2f;
 constexpr std::uint8_t FourWayEscMarker = 0x2e;
 constexpr int DefaultConnectAttempts = 30;
 constexpr int DefaultConnectDelayMs = 300;
+constexpr int DefaultPassthroughDelayMs = 2000;
 
 enum class ExitCode : int {
     Success = 0,
@@ -55,6 +56,7 @@ struct Options {
     std::string configPath;
     int connectAttempts = DefaultConnectAttempts;
     int connectDelayMs = DefaultConnectDelayMs;
+    int passthroughDelayMs = DefaultPassthroughDelayMs;
     bool reverse = false;
     bool help = false;
 };
@@ -130,6 +132,8 @@ void printUsage() {
         << "                      ESC connect attempts before failing. Default: 30.\n"
         << "  --connect-delay-ms <ms>\n"
         << "                      Delay between failed ESC connect attempts. Default: 300.\n"
+        << "  --passthrough-delay-ms <ms>\n"
+        << "                      Delay after MSP passthrough before ESC connect. Default: 2000.\n"
         << "  --help              Show this help.\n\n"
         << "Exit codes:\n"
         << "  0 success\n"
@@ -251,6 +255,20 @@ std::optional<Options> parseArguments(int argc, char* argv[], std::string& error
             continue;
         }
 
+        if (arg == "--passthrough-delay-ms" || arg.rfind("--passthrough-delay-ms=", 0) == 0) {
+            auto value = takeValue(i, argc, argv, arg);
+            if (!value || value->empty()) {
+                error = "--passthrough-delay-ms requires a value";
+                return std::nullopt;
+            }
+            auto parsed = parseIntInRange(*value, 0, 10000, "--passthrough-delay-ms", error);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            options.passthroughDelayMs = *parsed;
+            continue;
+        }
+
         error = "unknown argument: " + arg;
         return std::nullopt;
     }
@@ -367,6 +385,39 @@ Bytes makeMspCommand(std::uint8_t command, const Bytes& payload = {}) {
     }
     out.push_back(checksum);
     return out;
+}
+
+std::optional<Bytes> parseMspV1ResponsePayload(const Bytes& raw, std::uint8_t expectedCommand) {
+    for (std::size_t offset = 0; offset + 6 <= raw.size(); ++offset) {
+        if (raw[offset] != '$' || raw[offset + 1] != 'M' || raw[offset + 2] != '>') {
+            continue;
+        }
+
+        const std::size_t payloadLength = raw[offset + 3];
+        const std::size_t frameLength = 6 + payloadLength;
+        if (offset + frameLength > raw.size()) {
+            continue;
+        }
+
+        const std::uint8_t command = raw[offset + 4];
+        if (command != expectedCommand) {
+            continue;
+        }
+
+        std::uint8_t checksum = 0;
+        for (std::size_t i = offset + 3; i < offset + 5 + payloadLength; ++i) {
+            checksum ^= raw[i];
+        }
+
+        if (checksum != raw[offset + 5 + payloadLength]) {
+            continue;
+        }
+
+        return Bytes(raw.begin() + static_cast<std::ptrdiff_t>(offset + 5),
+                     raw.begin() + static_cast<std::ptrdiff_t>(offset + 5 + payloadLength));
+    }
+
+    return std::nullopt;
 }
 
 bool frameHasValidCrc(const Bytes& frame) {
@@ -704,7 +755,7 @@ std::uint16_t connectEsc(SerialPort& serial, int motorIndex, int maxAttempts, in
                              ". Last response: " + (lastFailure.empty() ? "none" : lastFailure));
 }
 
-void startPassthrough(SerialPort& serial) {
+std::optional<int> startPassthrough(SerialPort& serial, int settleDelayMs) {
     logInfo("starting MSP/four-way passthrough");
 
     const Bytes enableMotorControl = makeMspCommand(0x68);
@@ -718,6 +769,19 @@ void startPassthrough(SerialPort& serial) {
     serial.writeAll(startFourWay);
     const Bytes passthroughResponse = serial.readAvailable(300, 50);
     logInfo("MSP four-way passthrough: RX " + (passthroughResponse.empty() ? std::string("<none>") : hexDump(passthroughResponse)));
+
+    std::optional<int> expectedEscCount;
+    if (auto payload = parseMspV1ResponsePayload(passthroughResponse, 0xf5); payload && !payload->empty()) {
+        expectedEscCount = static_cast<int>((*payload)[0]);
+        logInfo("flight controller reports " + std::to_string(*expectedEscCount) + " ESC output(s)");
+    }
+
+    if (settleDelayMs > 0) {
+        logInfo("waiting " + std::to_string(settleDelayMs) + " ms for four-way passthrough to settle");
+        std::this_thread::sleep_for(std::chrono::milliseconds(settleDelayMs));
+    }
+
+    return expectedEscCount;
 }
 
 void writeEeprom(SerialPort& serial, const Bytes& config, std::uint16_t eepromAddress) {
@@ -804,14 +868,22 @@ int run(const Options& options) {
         return static_cast<int>(ExitCode::SerialOpenError);
     }
 
+    std::optional<int> expectedEscCount;
     try {
-        startPassthrough(serial);
+        expectedEscCount = startPassthrough(serial, options.passthroughDelayMs);
     } catch (const SerialIoException& ex) {
         logError(std::string("serial I/O failed while starting passthrough: ") + ex.what());
         return static_cast<int>(ExitCode::SerialIoError);
     } catch (const std::exception& ex) {
         logError(std::string("failed to start passthrough: ") + ex.what());
         return static_cast<int>(ExitCode::PassthroughError);
+    }
+
+    if (expectedEscCount && options.motorIndex >= *expectedEscCount) {
+        logError("requested ESC index " + std::to_string(options.motorIndex) +
+                 " but flight controller reported only " + std::to_string(*expectedEscCount) + " ESC output(s)");
+        cleanupPassthrough(serial);
+        return static_cast<int>(ExitCode::InvalidArguments);
     }
 
     std::uint16_t eepromAddress = 0;

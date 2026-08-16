@@ -10,6 +10,7 @@
 # Qt Creator / clangd generated state
 .qtc_clangd/.cache/
 .cache/
+.tmp-am32-configurator-web/
 compile_commands.json
 
 # CMake generated state
