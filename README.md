@@ -22,9 +22,9 @@ Arguments:
 - `--index <0-3>`: ESC/motor index behind the flight-controller passthrough.
 - `--config <path>`: AM32 EEPROM config binary. The first 48 bytes are written.
 - `--reverse`: sets EEPROM byte `17` to `1` before writing. Without this flag, byte `17` is left as it exists in the config file.
-- `--connect-attempts <count>`: ESC connect attempts before failing. Default: `30`.
-- `--connect-delay-ms <ms>`: delay between failed ESC connect attempts. Default: `300`.
-- `--passthrough-delay-ms <ms>`: delay after MSP passthrough starts before the first ESC connect attempt. Default: `2000`.
+- `--connect-attempts <count>`: ESC connect/read attempts before failing. Default: `30`.
+- `--connect-delay-ms <ms>`: delay between failed ESC connect/read attempts. Default: `300`.
+- `--passthrough-delay-ms <ms>`: delay after MSP passthrough starts before the first ESC read. Default: `2000`.
 - `--no-verify`: skip EEPROM readback verification after writing.
 - `--reset-esc-after-write`: reset the target ESC after writing. Disabled by default.
 - `--reset-fc-after-write`: send MSP flight-controller reset after exiting four-way mode. Disabled by default.
@@ -92,7 +92,7 @@ build\am32-cli.exe
 - The new CLI entrypoint is `main.cpp`.
 - The CMake build intentionally excludes the old Qt Widgets files: `widget.cpp`, `widget.h`, and `widget.ui`.
 - Serial I/O uses the Windows API directly, so the built executable does not require Qt runtime DLLs.
-- The CLI opens the port at `115200 8N1`, sends MSP commands to start four-way passthrough, waits for passthrough to settle, connects to the requested ESC index, detects the EEPROM address from the ESC MCU id, writes the 48-byte config, then reads it back for verification.
+- The CLI opens the port at `115200 8N1`, probes MSP API/FC/motor information, starts four-way passthrough, waits for passthrough to settle, connects to the requested ESC index, detects the EEPROM address from the ESC MCU id, reads the current settings like the configurator Read action, writes the 48-byte config, then reads it back for verification.
 - The old Qt GUI source files are still present as migration reference material but are not part of the CLI build.
 - By default, cleanup only exits four-way mode. It does not reset the ESC or flight controller after a settings write. This matches the AM32 web configurator settings-write behavior and avoids making the next ESC connect wait for devices to become ready again.
 
@@ -113,11 +113,11 @@ then the flight controller is responding and four-way passthrough is active, but
 
 It is acceptable for the MSP setup commands to show `RX <none>` if the later four-way connect succeeds. Some flight-controller firmware enters passthrough without returning a visible MSP response.
 
-The CLI waits `2000 ms` after MSP passthrough starts before the first ESC connect attempt. This matches the AM32 web configurator behavior and prevents the common early `ACK 0x0F` rejection while the four-way interface is still settling.
+The CLI waits `2000 ms` after MSP passthrough starts before the first ESC read attempt. This matches the AM32 web configurator behavior and prevents the common early `ACK 0x0F` rejection while the four-way interface is still settling.
 
 If follow-up runs connect slowly after a successful write, avoid `--reset-esc-after-write` and `--reset-fc-after-write`. The default cleanup path intentionally skips those resets so batch writes across multiple ESC indexes do not wait for reboot/recovery windows.
 
-The CLI still treats early connect rejections as transient and keeps trying for the configured retry window. If the ESC often needs longer to become ready, increase the window:
+The CLI treats early connect/read rejections as transient and retries the full ESC read sequence for the configured window. Individual four-way commands also get the same short retry cadence used by the web configurator. If the ESC often needs longer to become ready, increase the window:
 
 ```powershell
 am32-cli --port COM4 --index 2 --config .\am32_v3_config.bin --reverse --connect-attempts 60 --connect-delay-ms 500

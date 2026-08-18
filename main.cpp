@@ -45,12 +45,21 @@ constexpr std::uint16_t EepromAddressF051 = 0x7c00;
 constexpr std::uint16_t EepromAddressF3 = 0xf800;
 constexpr std::uint16_t EepromAddressNxp = 0xe000;
 constexpr std::size_t ConfigSize = 48;
+constexpr std::size_t WebSettingsReadSize = 0xb8;
 constexpr std::size_t DirectionByteIndex = 17;
 constexpr std::uint8_t FourWayPcMarker = 0x2f;
 constexpr std::uint8_t FourWayEscMarker = 0x2e;
+constexpr std::uint8_t MspApiVersion = 0x01;
+constexpr std::uint8_t MspFcVariant = 0x02;
+constexpr std::uint8_t MspMotor = 0x68;
+constexpr std::uint8_t MspBatteryState = 0x82;
+constexpr std::uint8_t MspMotorConfig = 0x83;
+constexpr std::uint8_t MspSetPassthrough = 0xf5;
 constexpr int DefaultConnectAttempts = 30;
 constexpr int DefaultConnectDelayMs = 300;
 constexpr int DefaultPassthroughDelayMs = 2000;
+constexpr int DefaultFourWayCommandRetries = 10;
+constexpr int DefaultFourWayCommandRetryDelayMs = 250;
 
 enum class ExitCode : int {
     Success = 0,
@@ -146,11 +155,11 @@ void printUsage() {
         << "Optional arguments:\n"
         << "  --reverse           Set EEPROM direction byte 17 to reverse before writing.\n"
         << "  --connect-attempts <count>\n"
-        << "                      ESC connect attempts before failing. Default: 30.\n"
+        << "                      ESC connect/read attempts before failing. Default: 30.\n"
         << "  --connect-delay-ms <ms>\n"
-        << "                      Delay between failed ESC connect attempts. Default: 300.\n"
+        << "                      Delay between failed ESC connect/read attempts. Default: 300.\n"
         << "  --passthrough-delay-ms <ms>\n"
-        << "                      Delay after MSP passthrough before ESC connect. Default: 2000.\n"
+        << "                      Delay after MSP passthrough before first ESC read. Default: 2000.\n"
         << "  --no-verify         Skip EEPROM readback after write.\n"
         << "  --reset-esc-after-write\n"
         << "                      Reset the target ESC after write. Disabled by default.\n"
@@ -542,6 +551,18 @@ bool isAckOk(const Bytes& frame) {
     return frame.size() >= 3 && frame[frame.size() - 3] == 0x00;
 }
 
+std::string asciiString(const Bytes& data) {
+    std::string result;
+    result.reserve(data.size());
+    for (const auto byte : data) {
+        if (byte == 0) {
+            break;
+        }
+        result.push_back(static_cast<char>(byte));
+    }
+    return result;
+}
+
 std::uint8_t ackByte(const Bytes& frame) {
     if (frame.size() < 3) {
         return 0xff;
@@ -751,6 +772,13 @@ public:
         static_cast<void>(readAvailable(timeoutMs, 25));
     }
 
+    void clearInput() {
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            throw SerialIoException("serial port is not open");
+        }
+        PurgeComm(handle_, PURGE_RXCLEAR);
+    }
+
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 };
@@ -760,85 +788,219 @@ ParsedFourWayResponse transactFourWay(SerialPort& serial,
                                       const std::string& operation,
                                       int readTimeoutMs = 1000) {
     logInfo(operation + ": TX " + hexDump(request));
+    serial.clearInput();
     serial.writeAll(request);
     const Bytes raw = serial.readAvailable(readTimeoutMs, 75);
     logInfo(operation + ": RX " + (raw.empty() ? std::string("<none>") : hexDump(raw)));
     return parseFourWayResponse(raw);
 }
 
-std::uint16_t connectEsc(SerialPort& serial, int motorIndex, int maxAttempts, int retryDelayMs) {
+ParsedFourWayResponse transactFourWayWithAckRetries(SerialPort& serial,
+                                                    const Bytes& request,
+                                                    const std::string& operation,
+                                                    int maxAttempts = DefaultFourWayCommandRetries,
+                                                    int retryDelayMs = DefaultFourWayCommandRetryDelayMs,
+                                                    int readTimeoutMs = 200) {
     std::string lastFailure;
 
     for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
-        logInfo("connecting to ESC index " + std::to_string(motorIndex) + ", attempt " +
-                std::to_string(attempt) + "/" + std::to_string(maxAttempts));
-
         auto response = transactFourWay(
             serial,
-            makeFourWayCommand(0x37, static_cast<std::uint8_t>(motorIndex)),
-            "four-way connect",
-            1000);
+            request,
+            operation + " attempt " + std::to_string(attempt) + "/" + std::to_string(maxAttempts),
+            readTimeoutMs);
 
-        if (!response.error.empty()) {
-            lastFailure = response.error;
-            logInfo("ESC connect attempt failed: " + lastFailure);
-        } else if (!isAckOk(response.frame)) {
-            lastFailure = describeFourWayFrame(response.frame);
-            logInfo("ESC connect attempt rejected: " + lastFailure);
-        } else {
-            if (response.frame.size() <= 6) {
-                throw std::runtime_error("ESC connect frame is too short to identify MCU");
-            }
-
-            const std::uint8_t mcu = response.frame[6];
-            if (mcu == 0x2b) {
-                logInfo("detected G071 ESC, EEPROM address " + hexWord(EepromAddressG071));
-                return EepromAddressG071;
-            }
-            if (mcu == 0x1f) {
-                logInfo("detected F051 ESC, EEPROM address " + hexWord(EepromAddressF051));
-                return EepromAddressF051;
-            }
-            if (mcu == 0x35) {
-                logInfo("detected F3 ESC, EEPROM address " + hexWord(EepromAddressF3));
-                return EepromAddressF3;
-            }
-            if (mcu == 0x15) {
-                logInfo("detected NXP ESC, EEPROM address " + hexWord(EepromAddressNxp));
-                return EepromAddressNxp;
-            }
-
-            lastFailure = "unsupported/unknown ESC MCU id " + hexByte(mcu);
-            logInfo("ESC connect attempt failed: " + lastFailure);
+        if (response.error.empty() && isAckOk(response.frame)) {
+            return response;
         }
 
+        lastFailure = response.error.empty() ? describeFourWayFrame(response.frame) : response.error;
+        logInfo(operation + " attempt failed: " + lastFailure);
+
         if (attempt < maxAttempts && retryDelayMs > 0) {
-            logInfo("waiting " + std::to_string(retryDelayMs) + " ms before next ESC connect attempt");
             std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
         }
     }
 
-    throw std::runtime_error("could not connect to ESC index " + std::to_string(motorIndex) +
+    throw ProtocolException(operation + " failed after " + std::to_string(maxAttempts) +
+                            " attempt(s). Last response: " +
+                            (lastFailure.empty() ? "none" : lastFailure));
+}
+
+std::uint16_t eepromAddressFromMcu(std::uint8_t mcu) {
+    if (mcu == 0x2b) {
+        logInfo("detected G071 ESC, EEPROM address " + hexWord(EepromAddressG071));
+        return EepromAddressG071;
+    }
+    if (mcu == 0x1f) {
+        logInfo("detected F051 ESC, EEPROM address " + hexWord(EepromAddressF051));
+        return EepromAddressF051;
+    }
+    if (mcu == 0x35) {
+        logInfo("detected F3 ESC, EEPROM address " + hexWord(EepromAddressF3));
+        return EepromAddressF3;
+    }
+    if (mcu == 0x15) {
+        logInfo("detected NXP ESC, EEPROM address " + hexWord(EepromAddressNxp));
+        return EepromAddressNxp;
+    }
+
+    throw std::runtime_error("unsupported/unknown ESC MCU id " + hexByte(mcu));
+}
+
+Bytes readEscSettingsForReadyCheck(SerialPort& serial, std::uint16_t eepromAddress) {
+    static_cast<void>(transactFourWayWithAckRetries(
+        serial,
+        makeFourWayReadCommand(32, static_cast<std::uint16_t>(eepromAddress - 32)),
+        "ESC firmware-name read"));
+
+    auto response = transactFourWayWithAckRetries(
+        serial,
+        makeFourWayReadCommand(WebSettingsReadSize, eepromAddress),
+        "ESC settings read");
+
+    const Bytes settings = fourWayParams(response.frame);
+    if (settings.size() < ConfigSize) {
+        throw std::runtime_error("ESC settings read size mismatch: expected at least " +
+                                 std::to_string(ConfigSize) + ", got " + std::to_string(settings.size()));
+    }
+
+    return settings;
+}
+
+std::uint16_t readEscOnce(SerialPort& serial, int motorIndex) {
+    auto response = transactFourWayWithAckRetries(
+        serial,
+        makeFourWayCommand(0x37, static_cast<std::uint8_t>(motorIndex)),
+        "four-way connect index " + std::to_string(motorIndex),
+        2,
+        DefaultFourWayCommandRetryDelayMs,
+        200);
+
+    if (response.frame.size() <= 6) {
+        throw std::runtime_error("ESC connect frame is too short to identify MCU");
+    }
+
+    const std::uint16_t eepromAddress = eepromAddressFromMcu(response.frame[6]);
+    const Bytes settings = readEscSettingsForReadyCheck(serial, eepromAddress);
+    Bytes firstConfigBytes(settings.begin(), settings.begin() + static_cast<std::ptrdiff_t>(ConfigSize));
+    logInfo("ESC index " + std::to_string(motorIndex) +
+            " settings read OK; current first 48 bytes: " + hexDump(firstConfigBytes));
+    return eepromAddress;
+}
+
+std::uint16_t connectAndReadEsc(SerialPort& serial,
+                                int motorIndex,
+                                int targetCount,
+                                int maxAttempts,
+                                int retryDelayMs) {
+    std::string lastFailure;
+    const int sweepTargetCount = targetCount > 0 ? targetCount : motorIndex + 1;
+
+    for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+        logInfo("reading ESCs, sweep " + std::to_string(attempt) + "/" + std::to_string(maxAttempts));
+
+        for (int target = 0; target < sweepTargetCount; ++target) {
+            try {
+                const std::uint16_t eepromAddress = readEscOnce(serial, target);
+                if (target == motorIndex) {
+                    return eepromAddress;
+                }
+                logInfo("ESC index " + std::to_string(target) +
+                        " read OK during sweep; requested index is " + std::to_string(motorIndex));
+            } catch (const std::exception& ex) {
+                lastFailure = "index " + std::to_string(target) + ": " + ex.what();
+                logInfo("ESC read failed: " + lastFailure);
+            }
+        }
+
+        if (attempt < maxAttempts && retryDelayMs > 0) {
+            logInfo("waiting " + std::to_string(retryDelayMs) + " ms before next ESC read sweep");
+            std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
+        }
+    }
+
+    throw std::runtime_error("could not read ESC index " + std::to_string(motorIndex) +
                              ". Last response: " + (lastFailure.empty() ? "none" : lastFailure));
+}
+
+void scanEscInitTargets(SerialPort& serial, int targetCount) {
+    if (targetCount <= 0) {
+        return;
+    }
+
+    logInfo("diagnostic: scanning ESC init on " + std::to_string(targetCount) + " reported output(s)");
+    for (int target = 0; target < targetCount; ++target) {
+        try {
+            auto response = transactFourWay(
+                serial,
+                makeFourWayCommand(0x37, static_cast<std::uint8_t>(target)),
+                "diagnostic ESC init index " + std::to_string(target),
+                500);
+
+            if (!response.error.empty()) {
+                logInfo("diagnostic ESC index " + std::to_string(target) + ": " + response.error);
+            } else if (!isAckOk(response.frame)) {
+                logInfo("diagnostic ESC index " + std::to_string(target) + ": " + describeFourWayFrame(response.frame));
+            } else if (response.frame.size() > 6) {
+                logInfo("diagnostic ESC index " + std::to_string(target) + ": ACK OK, MCU " + hexByte(response.frame[6]));
+            } else {
+                logInfo("diagnostic ESC index " + std::to_string(target) + ": ACK OK, but response is too short");
+            }
+        } catch (const std::exception& ex) {
+            logWarn("diagnostic ESC index " + std::to_string(target) + " failed: " + ex.what());
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(DefaultFourWayCommandRetryDelayMs));
+    }
+}
+
+Bytes transactMsp(SerialPort& serial, std::uint8_t command, const std::string& operation, int timeoutMs = 300) {
+    const Bytes request = makeMspCommand(command);
+    logInfo(operation + ": TX " + hexDump(request));
+    serial.clearInput();
+    serial.writeAll(request);
+    const Bytes response = serial.readAvailable(timeoutMs, 50);
+    logInfo(operation + ": RX " + (response.empty() ? std::string("<none>") : hexDump(response)));
+    return response;
+}
+
+std::optional<Bytes> transactMspPayload(SerialPort& serial,
+                                        std::uint8_t command,
+                                        const std::string& operation,
+                                        int timeoutMs = 300) {
+    const Bytes response = transactMsp(serial, command, operation, timeoutMs);
+    auto payload = parseMspV1ResponsePayload(response, command);
+    if (!payload) {
+        logWarn(operation + " did not return a valid MSP v1 payload");
+    }
+    return payload;
 }
 
 std::optional<int> startPassthrough(SerialPort& serial, int settleDelayMs) {
     logInfo("starting MSP/four-way passthrough");
 
-    const Bytes enableMotorControl = makeMspCommand(0x68);
-    logInfo("MSP motor-control enable: TX " + hexDump(enableMotorControl));
-    serial.writeAll(enableMotorControl);
-    const Bytes enableResponse = serial.readAvailable(300, 50);
-    logInfo("MSP motor-control enable: RX " + (enableResponse.empty() ? std::string("<none>") : hexDump(enableResponse)));
+    static_cast<void>(transactMspPayload(serial, MspApiVersion, "MSP API version"));
 
-    const Bytes startFourWay = makeMspCommand(0xf5);
-    logInfo("MSP four-way passthrough: TX " + hexDump(startFourWay));
-    serial.writeAll(startFourWay);
-    const Bytes passthroughResponse = serial.readAvailable(300, 50);
-    logInfo("MSP four-way passthrough: RX " + (passthroughResponse.empty() ? std::string("<none>") : hexDump(passthroughResponse)));
+    std::string fcVariant;
+    if (auto payload = transactMspPayload(serial, MspFcVariant, "MSP FC variant"); payload && !payload->empty()) {
+        fcVariant = asciiString(*payload);
+        logInfo("flight controller variant: " + (fcVariant.empty() ? std::string("<unknown>") : fcVariant));
+    }
+
+    static_cast<void>(transactMspPayload(serial, MspBatteryState, "MSP battery state"));
+
+    const bool isInav = fcVariant == "INAV";
+    const std::uint8_t motorInfoCommand = isInav ? MspMotor : MspMotorConfig;
+    static_cast<void>(transactMspPayload(
+        serial,
+        motorInfoCommand,
+        isInav ? "MSP motor info" : "MSP motor config"));
+
+    const Bytes passthroughResponse = transactMsp(serial, MspSetPassthrough, "MSP four-way passthrough");
 
     std::optional<int> expectedEscCount;
-    if (auto payload = parseMspV1ResponsePayload(passthroughResponse, 0xf5); payload && !payload->empty()) {
+    if (auto payload = parseMspV1ResponsePayload(passthroughResponse, MspSetPassthrough); payload && !payload->empty()) {
         expectedEscCount = static_cast<int>((*payload)[0]);
         logInfo("flight controller reports " + std::to_string(*expectedEscCount) + " ESC output(s)");
     }
@@ -852,35 +1014,25 @@ std::optional<int> startPassthrough(SerialPort& serial, int settleDelayMs) {
 }
 
 void writeEeprom(SerialPort& serial, const Bytes& config, std::uint16_t eepromAddress) {
-    auto response = transactFourWay(
+    static_cast<void>(transactFourWayWithAckRetries(
         serial,
         makeFourWayWriteCommand(config, eepromAddress),
         "EEPROM write",
-        1500);
-
-    if (!response.error.empty()) {
-        throw ProtocolException(response.error);
-    }
-    if (!isAckOk(response.frame)) {
-        throw std::runtime_error("ESC returned bad ACK for EEPROM write: " + describeFourWayFrame(response.frame));
-    }
+        DefaultFourWayCommandRetries,
+        DefaultFourWayCommandRetryDelayMs,
+        1500));
 
     logInfo("EEPROM write acknowledged by ESC");
 }
 
 void verifyEepromReadback(SerialPort& serial, const Bytes& expectedConfig, std::uint16_t eepromAddress) {
-    auto response = transactFourWay(
+    auto response = transactFourWayWithAckRetries(
         serial,
         makeFourWayReadCommand(expectedConfig.size(), eepromAddress),
         "EEPROM readback",
+        DefaultFourWayCommandRetries,
+        DefaultFourWayCommandRetryDelayMs,
         1500);
-
-    if (!response.error.empty()) {
-        throw ProtocolException(response.error);
-    }
-    if (!isAckOk(response.frame)) {
-        throw std::runtime_error("ESC returned bad ACK for EEPROM readback: " + describeFourWayFrame(response.frame));
-    }
 
     const Bytes actual = fourWayParams(response.frame);
     if (actual.size() != expectedConfig.size()) {
@@ -997,14 +1149,22 @@ int run(const Options& options) {
 
     std::uint16_t eepromAddress = 0;
     try {
-        logInfo("ESC connect retry policy: " + std::to_string(options.connectAttempts) +
+        logInfo("ESC read retry policy: " + std::to_string(options.connectAttempts) +
                 " attempts, " + std::to_string(options.connectDelayMs) + " ms delay");
-        eepromAddress = connectEsc(serial, options.motorIndex, options.connectAttempts, options.connectDelayMs);
+        eepromAddress = connectAndReadEsc(
+            serial,
+            options.motorIndex,
+            expectedEscCount.value_or(options.motorIndex + 1),
+            options.connectAttempts,
+            options.connectDelayMs);
     } catch (const SerialIoException& ex) {
-        logError(std::string("serial I/O failed while connecting to ESC: ") + ex.what());
+        logError(std::string("serial I/O failed while reading ESC: ") + ex.what());
         return static_cast<int>(ExitCode::SerialIoError);
     } catch (const std::exception& ex) {
         logError(ex.what());
+        if (expectedEscCount) {
+            scanEscInitTargets(serial, *expectedEscCount);
+        }
         cleanupPassthrough(serial, false);
         return static_cast<int>(ExitCode::EscConnectError);
     }
