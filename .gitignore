@@ -1,6 +1,7 @@
 # IDE/editor state
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 *.user

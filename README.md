@@ -27,6 +27,7 @@ Arguments:
 - `--passthrough-delay-ms <ms>`: delay after MSP passthrough starts before the first ESC read. Default: `2000`.
 - `--no-verify`: skip EEPROM readback verification after writing.
 - `--reset-esc-after-write`: reset the target ESC after writing. Disabled by default.
+- `--esc-reset-recovery-ms <ms>`: delay after `--reset-esc-after-write` before the process exits. Default: `5000`; use `0` to skip.
 - `--reset-fc-after-write`: send MSP flight-controller reset after exiting four-way mode. Disabled by default.
 - `--help`: prints usage and exit codes.
 
@@ -115,7 +116,7 @@ It is acceptable for the MSP setup commands to show `RX <none>` if the later fou
 
 The CLI waits `2000 ms` after MSP passthrough starts before the first ESC read attempt. This matches the AM32 web configurator behavior and prevents the common early `ACK 0x0F` rejection while the four-way interface is still settling.
 
-If follow-up runs connect slowly after a successful write, avoid `--reset-esc-after-write` and `--reset-fc-after-write`. The default cleanup path intentionally skips those resets so batch writes across multiple ESC indexes do not wait for reboot/recovery windows.
+If follow-up runs connect slowly after a successful write, avoid `--reset-esc-after-write` and `--reset-fc-after-write`. When ESC reset is enabled, `--esc-reset-recovery-ms` controls the recovery wait before the next batch item starts.
 
 The CLI treats early connect/read rejections as transient and retries the full ESC read sequence for the configured window. Individual four-way commands also get the same short retry cadence used by the web configurator. If the ESC often needs longer to become ready, increase the window:
 

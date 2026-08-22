@@ -60,6 +60,7 @@ constexpr int DefaultConnectDelayMs = 300;
 constexpr int DefaultPassthroughDelayMs = 2000;
 constexpr int DefaultFourWayCommandRetries = 10;
 constexpr int DefaultFourWayCommandRetryDelayMs = 250;
+constexpr int DefaultEscResetRecoveryDelayMs = 5000;
 
 enum class ExitCode : int {
     Success = 0,
@@ -80,6 +81,7 @@ struct Options {
     int connectAttempts = DefaultConnectAttempts;
     int connectDelayMs = DefaultConnectDelayMs;
     int passthroughDelayMs = DefaultPassthroughDelayMs;
+    int escResetRecoveryDelayMs = DefaultEscResetRecoveryDelayMs;
     bool verifyReadback = true;
     bool resetEscAfterWrite = false;
     bool resetFcAfterWrite = false;
@@ -163,6 +165,8 @@ void printUsage() {
         << "  --no-verify         Skip EEPROM readback after write.\n"
         << "  --reset-esc-after-write\n"
         << "                      Reset the target ESC after write. Disabled by default.\n"
+        << "  --esc-reset-recovery-ms <ms>\n"
+        << "                      Delay after ESC reset before exiting. Default: 5000.\n"
         << "  --reset-fc-after-write\n"
         << "                      Send MSP FC reset after exiting four-way. Disabled by default.\n"
         << "  --help              Show this help.\n\n"
@@ -312,6 +316,20 @@ std::optional<Options> parseArguments(int argc, char* argv[], std::string& error
                 return std::nullopt;
             }
             options.passthroughDelayMs = *parsed;
+            continue;
+        }
+
+        if (arg == "--esc-reset-recovery-ms" || arg.rfind("--esc-reset-recovery-ms=", 0) == 0) {
+            auto value = takeValue(i, argc, argv, arg);
+            if (!value || value->empty()) {
+                error = "--esc-reset-recovery-ms requires a value";
+                return std::nullopt;
+            }
+            auto parsed = parseIntInRange(*value, 0, 30000, "--esc-reset-recovery-ms", error);
+            if (!parsed) {
+                return std::nullopt;
+            }
+            options.escResetRecoveryDelayMs = *parsed;
             continue;
         }
 
@@ -980,7 +998,24 @@ std::optional<Bytes> transactMspPayload(SerialPort& serial,
 std::optional<int> startPassthrough(SerialPort& serial, int settleDelayMs) {
     logInfo("starting MSP/four-way passthrough");
 
-    static_cast<void>(transactMspPayload(serial, MspApiVersion, "MSP API version"));
+    auto apiVersion = transactMspPayload(serial, MspApiVersion, "MSP API version");
+    if (!apiVersion) {
+        logWarn("MSP API version failed; trying to exit stale four-way mode before retry");
+        try {
+            static_cast<void>(transactFourWay(
+                serial,
+                makeFourWayCommand(0x34, 0x00),
+                "stale four-way exit",
+                500));
+        } catch (const std::exception& ex) {
+            logWarn(std::string("stale four-way exit failed: ") + ex.what());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        apiVersion = transactMspPayload(serial, MspApiVersion, "MSP API version retry");
+        if (!apiVersion) {
+            throw std::runtime_error("flight controller did not answer MSP API version");
+        }
+    }
 
     std::string fcVariant;
     if (auto payload = transactMspPayload(serial, MspFcVariant, "MSP FC variant"); payload && !payload->empty()) {
@@ -1079,7 +1114,11 @@ void cleanupPassthrough(SerialPort& serial, bool resetFlightController) {
     }
 }
 
-void cleanupAfterWrite(SerialPort& serial, int motorIndex, bool resetEsc, bool resetFlightController) {
+void cleanupAfterWrite(SerialPort& serial,
+                       int motorIndex,
+                       bool resetEsc,
+                       bool resetFlightController,
+                       int escResetRecoveryDelayMs) {
     if (resetEsc) {
         try {
             logInfo("resetting ESC after write");
@@ -1099,6 +1138,11 @@ void cleanupAfterWrite(SerialPort& serial, int motorIndex, bool resetEsc, bool r
     }
 
     cleanupPassthrough(serial, resetFlightController);
+
+    if (resetEsc && escResetRecoveryDelayMs > 0) {
+        logInfo("waiting " + std::to_string(escResetRecoveryDelayMs) + " ms for ESC reset recovery");
+        std::this_thread::sleep_for(std::chrono::milliseconds(escResetRecoveryDelayMs));
+    }
 }
 
 int run(const Options& options) {
@@ -1191,7 +1235,12 @@ int run(const Options& options) {
         return static_cast<int>(ExitCode::EscWriteError);
     }
 
-    cleanupAfterWrite(serial, options.motorIndex, options.resetEscAfterWrite, options.resetFcAfterWrite);
+    cleanupAfterWrite(
+        serial,
+        options.motorIndex,
+        options.resetEscAfterWrite,
+        options.resetFcAfterWrite,
+        options.escResetRecoveryDelayMs);
     logInfo("completed successfully");
     return static_cast<int>(ExitCode::Success);
 }
